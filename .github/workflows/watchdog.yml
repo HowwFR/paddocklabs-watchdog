@@ -51,12 +51,24 @@ jobs:
           status() { curl -s -m 30 -H "Authorization: Bearer $SB_TOKEN" "$API" | jq -r '.status // "unknown"'; }
           health() { curl -s -m 30 -H "Authorization: Bearer $SB_TOKEN" "$API/health?services=db&services=rest&services=auth&services=storage" | jq -r 'map(.name + "=" + (if .healthy then "ok" else "down" end)) | join(" ")' 2>/dev/null || echo "unknown"; }
 
+          # The watchdog's own keys must work, or it can't tell anything (a failed run emails the owner).
+          own=$(curl -s -o /dev/null -m 30 -w "%{http_code}" -H "Authorization: Bearer $SB_TOKEN" "$API")
+          if [ "$own" != 200 ]; then echo "::error::The Supabase access token was refused ($own). Set a new SUPABASE_ACCESS_TOKEN."; exit 1; fi
+
           if up; then echo "Server is up."; exit 0; fi
           echo "Down. Checking again in 90 seconds."; sleep 90
           if up; then echo "Back by itself."; exit 0; fi
 
           st=$(status); hl=$(health)
           echo "Project status: $st | $hl"
+          # Only act when Supabase's own health check agrees: one of the services the app uses is down.
+          if [ "$TEST" != "true" ]; then
+            case " $hl " in
+              *" db=down "*|*" rest=down "*|*" auth=down "*) ;;
+              *" db=ok "*) echo "::warning::The app's requests failed but Supabase says its services are fine ($hl). Not restarting."; exit 0 ;;
+              *) echo "::error::Couldn't read Supabase's health ($hl). Not restarting."; exit 1 ;;
+            esac
+          fi
           case "$st" in
             RESTARTING|COMING_UP|RESTORING|UPGRADING|PAUSING|GOING_DOWN|INIT_FAILED_RESTARTING)
               echo "Supabase is already working on it ($st)."; exit 0 ;;
@@ -69,13 +81,14 @@ jobs:
           fi
 
           if [ "$st" = "INACTIVE" ] || [ "$st" = "PAUSED" ]; then action=restore; else action=restart; fi
-          gh label create revive -R "$REPO" --color B60205 --description "The watchdog acted" 2>/dev/null || true
+          label=revive; [ "$TEST" = "true" ] && label=revive-test
+          gh label create "$label" -R "$REPO" --color B60205 --description "The watchdog acted" 2>/dev/null || true
           title="Server down: $action $(date -u '+%Y-%m-%d %H:%M UTC')"
           [ "$TEST" = "true" ] && title="TEST: $title (nothing restarted)"
           if [ "$TEST" = "true" ]; then code=skipped
           else code=$(curl -s -o /dev/null -m 60 -X POST -w "%{http_code}" -H "Authorization: Bearer $SB_TOKEN" "$API/$action"); fi
           echo "Asked Supabase to $action: $code"
-          issue=$(gh issue create -R "$REPO" --label revive --title "$title" --body "The app's requests failed twice, 90 seconds apart.
+          issue=$(gh issue create -R "$REPO" --label "$label" --title "$title" --body "The app's requests failed twice, 90 seconds apart.
 
           - Project status: \`$st\`
           - Services: \`$hl\`
@@ -84,6 +97,7 @@ jobs:
           Result follows below." )
           echo "$issue"
           [ "$TEST" = "true" ] && exit 0
+          case "$code" in 2*) ;; *) gh issue comment "$issue" --body "Supabase refused the $action ($code). Check the Supabase dashboard and the SUPABASE_ACCESS_TOKEN secret."; exit 1 ;; esac
 
           # Wait up to 12 minutes for it to come back, then say how it went.
           for i in $(seq 1 24); do
