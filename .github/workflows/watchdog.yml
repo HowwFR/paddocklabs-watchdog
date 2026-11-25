@@ -1,0 +1,107 @@
+# Keeps the PaddockLabs server up: every 5 minutes it checks what the app uses (sign-in and the Market). If they stay
+# down for 90 seconds, it asks Supabase to restart the project (or to un-pause it), at most once every 30 minutes,
+# then opens an issue saying what happened and whether the server came back.
+name: watchdog
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Test run: act as if the server were down, but don't restart anything"
+        type: boolean
+        default: false
+
+concurrency:
+  group: watchdog
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # keepalive commit (GitHub turns off schedules in quiet public repos after 60 days)
+  issues: write     # a report each time it acts
+
+env:
+  REF: nakvvpsvuaglevorblab
+  URL: https://nakvvpsvuaglevorblab.supabase.co
+  API: https://api.supabase.com/v1/projects/nakvvpsvuaglevorblab
+  COOLDOWN_MIN: 30
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check and revive
+        env:
+          SB_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          ANON: ${{ secrets.SUPABASE_ANON_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TEST: ${{ inputs.test == true }}
+        run: |
+          set -u
+          # What the app needs: the sign-in service and a database read through the API.
+          up() {
+            a=$(curl -s -o /dev/null -m 20 -w "%{http_code}" -H "apikey: $ANON" "$URL/auth/v1/health")
+            r=$(curl -s -o /dev/null -m 20 -w "%{http_code}" -H "apikey: $ANON" -H "Authorization: Bearer $ANON" "$URL/rest/v1/market_mods?select=id&limit=1")
+            echo "$(date -u +%H:%M:%S) sign-in $a, database $r"
+            [ "$TEST" != "true" ] && [ "$a" = 200 ] && [ "$r" = 200 ]
+          }
+          status() { curl -s -m 30 -H "Authorization: Bearer $SB_TOKEN" "$API" | jq -r '.status // "unknown"'; }
+          health() { curl -s -m 30 -H "Authorization: Bearer $SB_TOKEN" "$API/health?services=db&services=rest&services=auth&services=storage" | jq -r 'map(.name + "=" + (if .healthy then "ok" else "down" end)) | join(" ")' 2>/dev/null || echo "unknown"; }
+
+          if up; then echo "Server is up."; exit 0; fi
+          echo "Down. Checking again in 90 seconds."; sleep 90
+          if up; then echo "Back by itself."; exit 0; fi
+
+          st=$(status); hl=$(health)
+          echo "Project status: $st | $hl"
+          case "$st" in
+            RESTARTING|COMING_UP|RESTORING|UPGRADING|PAUSING|GOING_DOWN|INIT_FAILED_RESTARTING)
+              echo "Supabase is already working on it ($st)."; exit 0 ;;
+          esac
+
+          # At most one action per cooldown: the last report's time.
+          last=$(gh issue list -R "$REPO" --label revive --state all --limit 1 --json createdAt --jq '.[0].createdAt // ""')
+          if [ -n "$last" ] && [ $(( $(date -u +%s) - $(date -u -d "$last" +%s) )) -lt $(( COOLDOWN_MIN * 60 )) ]; then
+            echo "Acted less than $COOLDOWN_MIN minutes ago ($last): waiting."; exit 0
+          fi
+
+          if [ "$st" = "INACTIVE" ] || [ "$st" = "PAUSED" ]; then action=restore; else action=restart; fi
+          gh label create revive -R "$REPO" --color B60205 --description "The watchdog acted" 2>/dev/null || true
+          title="Server down: $action $(date -u '+%Y-%m-%d %H:%M UTC')"
+          [ "$TEST" = "true" ] && title="TEST: $title (nothing restarted)"
+          if [ "$TEST" = "true" ]; then code=skipped
+          else code=$(curl -s -o /dev/null -m 60 -X POST -w "%{http_code}" -H "Authorization: Bearer $SB_TOKEN" "$API/$action"); fi
+          echo "Asked Supabase to $action: $code"
+          issue=$(gh issue create -R "$REPO" --label revive --title "$title" --body "The app's requests failed twice, 90 seconds apart.
+
+          - Project status: \`$st\`
+          - Services: \`$hl\`
+          - Asked Supabase to **$action**: \`$code\`
+
+          Result follows below." )
+          echo "$issue"
+          [ "$TEST" = "true" ] && exit 0
+
+          # Wait up to 12 minutes for it to come back, then say how it went.
+          for i in $(seq 1 24); do
+            sleep 30
+            if up; then gh issue comment "$issue" --body "Back up after about $(( i / 2 )) minutes. Services: \`$(health)\`"; gh issue close "$issue"; exit 0; fi
+          done
+          gh issue comment "$issue" --body "Still down after 12 minutes. Project status: \`$(status)\`, services: \`$(health)\`. It will try again after the $COOLDOWN_MIN minute wait; check the Supabase dashboard."
+          exit 1
+
+  keepalive:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Keep the schedule on
+        run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $(( 45 * 86400 )) ]; then
+            git config user.name "watchdog"; git config user.email "watchdog@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive" && git push
+          fi
